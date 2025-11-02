@@ -1,0 +1,736 @@
+# main.py
+import os
+import random
+from datetime import datetime, timedelta
+
+import telebot
+from telebot import types
+from pymongo import MongoClient, ReturnDocument
+from dotenv import load_dotenv
+
+# === تحميل متغيرات البيئة (محليًا يستخدم .env) ===
+load_dotenv()
+
+# === إعدادات - ضع هذه المتغيرات في Render Environment أو في ملف .env محليًا ===
+TOKEN = os.getenv("TOKEN") or "8455107490:AAEbIFpHcKw3nWtiJkvtMMc6petNo5wZzm0"
+CHANNEL = os.getenv("CHANNEL") or "@Youssef_Osama2005"   # مثال: @Youssef_Osama2005
+DEV_ID = int(os.getenv("7938146499") or 0)                 # رقم الآي دي للمطور (مثلاً: 7938146499)
+MONGO_URI = os.getenv("MONGO_URI")                    # URI من MongoDB Atlas
+DB_NAME = os.getenv("DB_NAME") or "telegram_bank_db"
+
+if not MONGO_URI:
+    raise RuntimeError("ERROR: MONGO_URI غير معرف. ضع MONGO_URI في متغيرات البيئة.")
+
+# === تهيئة البوت وقاعدة البيانات ===
+bot = telebot.TeleBot(TOKEN)
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+
+users_col = db["users"]
+transactions_col = db["transactions"]
+shops_col = db["shops"]
+marriage_col = db["marriages"]
+clubs_col = db["clubs"]
+cooldowns_col = db["cooldowns"]
+stats_col = db["stats"]
+questions_col = db["questions"]
+fun_col = db["fun"]
+
+# === دوال مساعدة ===
+def format_money(x):
+    try:
+        return f"{int(x)} ₿"
+    except:
+        return "0 ₿"
+
+def require_subscription(user_id):
+    try:
+        member = bot.get_chat_member(CHANNEL, user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception:
+        return False
+
+def send_subscription_prompt(chat_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("📢 اشترك في القناة", url=f"https://t.me/{CHANNEL.replace('@','')}"))
+    bot.send_message(chat_id, f"⚠️ لازم تشترك في القناة أولًا: {CHANNEL}\nبعد الاشتراك اكتب /start", reply_markup=markup)
+
+def ensure_user_account(chat_id, user):
+    """Return user doc; create if not exists."""
+    chat = int(chat_id)
+    uid = int(user.id)
+    doc = users_col.find_one({"chat_id": chat, "user_id": uid})
+    if doc:
+        # تحديث اسم المستخدم لو تغيّر
+        if user.first_name and doc.get("username") != user.first_name:
+            users_col.update_one({"_id": doc["_id"]}, {"$set": {"username": user.first_name}})
+        return users_col.find_one({"chat_id": chat, "user_id": uid})
+    # إنشاء مستند جديد
+    acc_num = str(random.randint(100000, 999999))
+    new = {
+        "chat_id": chat,
+        "user_id": uid,
+        "username": user.first_name or "مستخدم",
+        "balance": 0,
+        "account_number": acc_num,
+        "has_account": False,
+        "assets": [],
+        "created_at": datetime.utcnow(),
+        "stats": {"earned":0,"spent":0,"received":0,"transfers":0}
+    }
+    users_col.insert_one(new)
+    return users_col.find_one({"chat_id": chat, "user_id": uid})
+
+def get_user_by_account(chat_id, acc_num):
+    return users_col.find_one({"chat_id": int(chat_id), "account_number": str(acc_num)})
+
+def record_transaction(chat_id, kind, from_user, to_user, amount, note=""):
+    transactions_col.insert_one({
+        "chat_id": int(chat_id),
+        "kind": kind,
+        "from_user": int(from_user) if from_user else None,
+        "to_user": int(to_user) if to_user else None,
+        "amount": int(amount),
+        "note": note,
+        "ts": datetime.utcnow()
+    })
+
+def set_cooldown(chat_id, user_id, name, seconds):
+    key = {"chat_id": int(chat_id), "user_id": int(user_id), "name": name}
+    expires = datetime.utcnow() + timedelta(seconds=seconds)
+    cooldowns_col.update_one(key, {"$set": {"expires_at": expires}}, upsert=True)
+
+def cooldown_remaining(chat_id, user_id, name):
+    rec = cooldowns_col.find_one({"chat_id": int(chat_id), "user_id": int(user_id), "name": name})
+    if not rec: return 0
+    rem = (rec["expires_at"] - datetime.utcnow()).total_seconds()
+    return int(rem) if rem>0 else 0
+
+# === تهيئة معرض مبدئي لو لم يكن موجود ===
+if shops_col.count_documents({}) == 0:
+    shops_col.insert_many([
+        {"item_id": "car1", "name": "سيارة رياضية", "price": 500},
+        {"item_id": "house1", "name": "بيت صغير", "price": 1000},
+        {"item_id": "farm1", "name": "مزرعة", "price": 300}
+    ])
+
+# === أوامر أساسية وقائمة ===
+@bot.message_handler(commands=['start'])
+def cmd_start(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    ensure_user_account(m.chat.id, m.from_user)
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🏦 اوامر البنك", "🎮 العاب")
+    markup.add("😂 تسلية", "📊 رصيدي")
+    markup.add("🏆 توب الفلوس", "🕹 العاب جديدة")
+    if m.from_user.id == DEV_ID:
+        markup.add("🔧 اوامر المطور")
+    bot.send_message(m.chat.id, f"أهلاً {m.from_user.first_name} 👋\nاختر من القائمة:", reply_markup=markup)
+
+# === اوامر البنك: عرض القائمة ===
+@bot.message_handler(func=lambda msg: msg.text == "🏦 اوامر البنك")
+def bank_menu(msg):
+    if not require_subscription(msg.from_user.id):
+        send_subscription_prompt(msg.chat.id); return
+    text = (
+        "☆ اوامر البنك\n\n"
+        "⌯ انشاء حساب بنكي\n⌯ مسح حساب بنكي\n⌯ تحويل\n⌯ حسابي\n⌯ فلوسي\n⌯ راتب\n⌯ بخشيش\n⌯ زرف\n⌯ استثمار\n⌯ حظ\n⌯ مضاربه\n⌯ هجوم\n⌯ كنز\n⌯ مراهنه\n⌯ توب الفلوس\n⌯ توب الزرف\n⌯ زواج\n⌯ زواجي\n⌯ طلاق\n⌯ معرض\n⌯ شراء\n⌯ ممتلكاتي\n⌯ تبرع\n⌯ انشاء نادي\n⌯ شراء لاعب\n"
+    )
+    bot.send_message(msg.chat.id, text)
+
+# === انشاء الحساب البنكي ===
+@bot.message_handler(func=lambda m: m.text == "انشاء حساب بنكي")
+def create_account(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    doc = ensure_user_account(m.chat.id, m.from_user)
+    if doc.get("has_account"):
+        bot.reply_to(m, "❗ لديك بالفعل حساب بنكي.")
+        return
+    users_col.update_one({"chat_id": doc["chat_id"], "user_id": doc["user_id"]}, {"$set": {"has_account": True, "balance": 100}})
+    bot.reply_to(m, f"✅ تم إنشاء الحساب. رقم حسابك: `{doc['account_number']}`\nرصيد البداية: {format_money(100)}", parse_mode='Markdown')
+
+# === مسح الحساب ===
+@bot.message_handler(func=lambda m: m.text == "مسح حساب بنكي")
+def delete_account(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    doc = ensure_user_account(m.chat.id, m.from_user)
+    if not doc.get("has_account"):
+        bot.reply_to(m, "❗ ليس لديك حساب بنكي.")
+        return
+    users_col.update_one({"chat_id": doc["chat_id"], "user_id": doc["user_id"]}, {"$set": {"has_account": False, "balance": 0}})
+    bot.reply_to(m, "✅ تم مسح حسابك البنكي.")
+
+# === حسابي وفلوسي ===
+@bot.message_handler(func=lambda m: m.text == "حسابي")
+def show_account(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    doc = ensure_user_account(m.chat.id, m.from_user)
+    bot.reply_to(m, f"📬 رقم حسابك: `{doc['account_number']}`", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda m: m.text == "فلوسي")
+def show_balance(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    doc = ensure_user_account(m.chat.id, m.from_user)
+    bot.reply_to(m, f"💠 رصيدك: {format_money(doc.get('balance',0))}")
+
+# === تحويل (رد على رسالة الشخص) ===
+@bot.message_handler(commands=['transfer','تحويل'])
+def transfer_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    if not m.reply_to_message:
+        bot.reply_to(m, "❗ رد على رسالة الشخص المراد تحويله أو اكتب: /transfer <amount> (رد على رسالة المستلم)."); return
+    try:
+        amount = int(m.text.split()[1])
+    except:
+        bot.reply_to(m, "❗ الصيغة: /transfer <amount>"); return
+    sender = ensure_user_account(m.chat.id, m.from_user)
+    receiver = ensure_user_account(m.chat.id, m.reply_to_message.from_user)
+    if not sender.get("has_account"):
+        bot.reply_to(m, "❗ افتح حساب بنكي أولاً"); return
+    if not receiver.get("has_account"):
+        bot.reply_to(m, "❗ المستلم ليس لديه حساب بنكي"); return
+    if sender.get("balance",0) < amount:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -amount}})
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.reply_to_message.from_user.id}, {"$inc": {"balance": amount, "stats.received": amount}})
+    record_transaction(m.chat.id, "transfer", m.from_user.id, m.reply_to_message.from_user.id, amount, note="user transfer")
+    bot.reply_to(m, f"✅ تم تحويل {format_money(amount)} إلى {m.reply_to_message.from_user.first_name}.")
+
+# === راتب (cooldown 10 دقائق) ===
+@bot.message_handler(func=lambda m: m.text == "راتب")
+def pay_salary(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    rem = cooldown_remaining(m.chat.id, m.from_user.id, "salary")
+    if rem > 0:
+        bot.reply_to(m, f"⌛ يمكنك استلام الراتب بعد {rem} ثانية.")
+        return
+    doc = ensure_user_account(m.chat.id, m.from_user)
+    if not doc.get("has_account"):
+        bot.reply_to(m, "❗ افتح حساب بنكي أولاً."); return
+    amount = random.randint(20,50)
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": amount}})
+    set_cooldown(m.chat.id, m.from_user.id, "salary", 600)
+    record_transaction(m.chat.id, "salary", None, m.from_user.id, amount)
+    bot.reply_to(m, f"💵 تم استلام الراتب: {format_money(amount)}")
+
+# === بخشيش (cooldown 10 دقائق) ===
+@bot.message_handler(func=lambda m: m.text == "بخشيش")
+def tip_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    rem = cooldown_remaining(m.chat.id, m.from_user.id, "tip")
+    if rem > 0:
+        bot.reply_to(m, f"⌛ يمكنك الحصول على بخشيش بعد {rem} ثانية."); return
+    amount = random.randint(5,15)
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": amount}})
+    set_cooldown(m.chat.id, m.from_user.id, "tip", 600)
+    record_transaction(m.chat.id, "tip", None, m.from_user.id, amount)
+    bot.reply_to(m, f"🎁 حصلت على بخشيش: {format_money(amount)}")
+
+# === زرف (cooldown 10 دقائق) ===
+@bot.message_handler(func=lambda m: m.text == "زرف")
+def zarf_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    rem = cooldown_remaining(m.chat.id, m.from_user.id, "zarf")
+    if rem > 0:
+        bot.reply_to(m, f"⌛ يمكنك طلب زرف بعد {rem} ثانية."); return
+    amount = random.randint(10,40)
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": amount, "stats.received": amount}})
+    set_cooldown(m.chat.id, m.from_user.id, "zarf", 600)
+    stats_col.update_one({"chat_id": m.chat.id}, {"$inc": {"zarf_count": 1}}, upsert=True)
+    record_transaction(m.chat.id, "zarf", None, m.from_user.id, amount)
+    bot.reply_to(m, f"🪙 تم زرفك: {format_money(amount)}")
+
+# === استثمار ===
+@bot.message_handler(func=lambda m: m.text == "استثمار")
+def invest_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "✳️ اكتب المبلغ الذي تريد استثماره الآن (مثال: 50) كرسالة منفصلة:")
+    bot.register_next_step_handler(m, invest_do)
+
+def invest_do(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    try:
+        amount = int(m.text.strip())
+    except:
+        bot.reply_to(m, "❗ المبلغ لازم يكون رقم صحيح."); return
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    if not acc.get("has_account"):
+        bot.reply_to(m, "❗ افتح حساب بنكي أولا."); return
+    if acc.get("balance",0) < amount:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    pct = random.randint(1,15)
+    profit = int(amount * pct / 100)
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -amount}})
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": profit}})
+    record_transaction(m.chat.id, "invest", m.from_user.id, m.from_user.id, profit, note=f"invest {pct}%")
+    bot.reply_to(m, f"📈 استثمرت {format_money(amount)} وربحت {format_money(profit)} ({pct}%).")
+
+# === حظ ===
+@bot.message_handler(func=lambda m: m.text == "حظ")
+def gamble_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "🎲 اكتب المبلغ الذي تريد المراهنة به (مثال: 50):")
+    bot.register_next_step_handler(m, gamble_do)
+
+def gamble_do(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    try:
+        amount = int(m.text.strip())
+    except:
+        bot.reply_to(m, "❗ المبلغ لازم يكون رقم صحيح."); return
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    if acc.get("balance",0) < amount:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    if random.random() < 0.5:
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": amount}})
+        record_transaction(m.chat.id, "gamble_win", None, m.from_user.id, amount)
+        bot.reply_to(m, f"🎉 فزت! ربحك {format_money(amount)}")
+    else:
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -amount}})
+        record_transaction(m.chat.id, "gamble_loss", m.from_user.id, None, amount)
+        bot.reply_to(m, f"😢 خسرت {format_money(amount)}")
+
+# === مضاربه ===
+@bot.message_handler(func=lambda m: m.text == "مضاربه")
+def spec_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "⚠️ اكتب المبلغ الذي تريد المضاربة به (مثال: 100):")
+    bot.register_next_step_handler(m, spec_do)
+
+def spec_do(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    try:
+        amount = int(m.text.strip())
+    except:
+        bot.reply_to(m, "❗ المبلغ لازم يكون رقم صحيح."); return
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    if acc.get("balance",0) < amount:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    pct = random.randint(-90,90)
+    result = int(amount * pct / 100)
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": result}})
+    record_transaction(m.chat.id, "speculation", m.from_user.id, None, result, note=f"spec {pct}%")
+    if result >= 0:
+        bot.reply_to(m, f"🚀 ربح: {format_money(result)} ({pct}%)")
+    else:
+        bot.reply_to(m, f"💥 خسارة: {format_money(-result)} ({pct}%)")
+
+# === هجوم ===
+@bot.message_handler(func=lambda m: m.text == "هجوم")
+def attack_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "⚠️ رد على رسالة الضحية واكتب: /attack <amount>")
+
+@bot.message_handler(commands=['attack'])
+def attack_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    if not m.reply_to_message:
+        bot.reply_to(m, "❗ رد على رسالة الضحية ثم اكتب: /attack <amount>"); return
+    try:
+        amount = int(m.text.split()[1])
+    except:
+        bot.reply_to(m, "❗ الصيغة: /attack <amount>"); return
+    attacker = ensure_user_account(m.chat.id, m.from_user)
+    victim = ensure_user_account(m.chat.id, m.reply_to_message.from_user)
+    if attacker.get("balance",0) < amount:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    if random.random() < 0.6:
+        stolen = int(amount * random.uniform(0.1,0.5))
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.reply_to_message.from_user.id}, {"$inc": {"balance": -stolen}})
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": stolen}})
+        record_transaction(m.chat.id, "attack", m.from_user.id, m.reply_to_message.from_user.id, stolen)
+        bot.reply_to(m, f"🔪 نجحت! سرقت {format_money(stolen)}")
+    else:
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -amount}})
+        record_transaction(m.chat.id, "attack_fail", m.from_user.id, m.reply_to_message.from_user.id, amount)
+        bot.reply_to(m, f"❌ فشل الهجوم وخسرت {format_money(amount)}")
+
+# === كنز ===
+@bot.message_handler(func=lambda m: m.text == "كنز")
+def chest_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    amount = random.choice([20,50,100,200])
+    if random.random() < 0.5:
+        bot.reply_to(m, "🪦 للأسف لم تجد شيئًا هذه المرة.")
+    else:
+        ensure_user_account(m.chat.id, m.from_user)
+        users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": amount}})
+        record_transaction(m.chat.id, "chest", None, m.from_user.id, amount)
+        bot.reply_to(m, f"🎉 حصلت على كنز: {format_money(amount)}")
+
+# === توب الفلوس و توب الزرف ===
+@bot.message_handler(func=lambda m: m.text == "توب الفلوس")
+def top_money(m):
+    cursor = users_col.find({"chat_id": int(m.chat.id), "has_account": True}).sort("balance", -1).limit(10)
+    msg = "🏆 توب الأغنياء في الجروب:\n"
+    i = 1
+    for doc in cursor:
+        msg += f"{i}. {doc.get('username','مستخدم')} — {format_money(doc.get('balance',0))}\n"
+        i += 1
+    bot.reply_to(m, msg)
+
+@bot.message_handler(func=lambda m: m.text == "توب الزرف")
+def top_zarf(m):
+    st = stats_col.find_one({"chat_id": m.chat.id}) or {}
+    zarf_count = st.get("zarf_count", 0)
+    bot.reply_to(m, f"📊 إجمالي عمليات الزرف في الجروب: {zarf_count}")
+
+# === زواج / زواجي / طلاق ===
+@bot.message_handler(func=lambda m: m.text == "زواج")
+def marry_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "💍 للزواج: رِد على رسالة الشخص واكتب: /marry <dowry>")
+
+@bot.message_handler(commands=['marry'])
+def marry_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    if not m.reply_to_message:
+        bot.reply_to(m, "❗ رِد على رسالة الشخص المراد الزواج به."); return
+    try:
+        dowry = int(m.text.split()[1])
+    except:
+        bot.reply_to(m, "❗ اكتب المهر مثال: /marry 100"); return
+    groom = ensure_user_account(m.chat.id, m.from_user)
+    bride = ensure_user_account(m.chat.id, m.reply_to_message.from_user)
+    if groom.get("balance",0) < dowry:
+        bot.reply_to(m, "❌ معندكش رصيد كافٍ."); return
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -dowry}})
+    marriage_col.insert_one({"chat_id": m.chat.id, "husband": m.from_user.id, "wife": m.reply_to_message.from_user.id, "dowry": dowry, "ts": datetime.utcnow()})
+    record_transaction(m.chat.id, "marry", m.from_user.id, m.reply_to_message.from_user.id, dowry)
+    bot.reply_to(m, f"💒 تم الزواج! مهر: {format_money(dowry)}")
+
+@bot.message_handler(func=lambda m: m.text == "زواجي")
+def my_marriage(m):
+    rec = marriage_col.find_one({"chat_id": m.chat.id, "$or":[{"husband": m.from_user.id},{"wife": m.from_user.id}]})
+    if not rec:
+        bot.reply_to(m, "❗ أنت غير متزوج هنا."); return
+    partner_id = rec["wife"] if rec["husband"] == m.from_user.id else rec["husband"]
+    try:
+        partner = bot.get_chat_member(m.chat.id, partner_id).user
+        bot.reply_to(m, f"💍 أنت متزوج من: {partner.first_name} — مهر: {format_money(rec['dowry'])}")
+    except:
+        bot.reply_to(m, f"💍 متزوج — مهر: {format_money(rec['dowry'])}")
+
+@bot.message_handler(func=lambda m: m.text == "طلاق")
+def divorce_cmd(m):
+    rec = marriage_col.find_one({"chat_id": m.chat.id, "$or":[{"husband": m.from_user.id},{"wife": m.from_user.id}]})
+    if not rec:
+        bot.reply_to(m, "❗ أنت غير متزوج."); return
+    marriage_col.delete_one({"_id": rec["_id"]})
+    bot.reply_to(m, "⚖️ تم الطلاق.")
+
+# === معرض وشراء و ممتلكاتي ===
+@bot.message_handler(func=lambda m: m.text == "معرض")
+def show_shop(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    items = list(shops_col.find({}))
+    msg = "🏬 معرض المتجر:\n"
+    for it in items:
+        msg += f"- {it['name']} — {format_money(it['price'])} — ارسل /buy {it['item_id']}\n"
+    bot.reply_to(m, msg)
+
+@bot.message_handler(commands=['buy'])
+def buy_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    parts = m.text.split()
+    if len(parts) < 2:
+        bot.reply_to(m, "❗ استخدم: /buy <item_id>"); return
+    item_id = parts[1]
+    item = shops_col.find_one({"item_id": item_id})
+    if not item:
+        bot.reply_to(m, "❗ العنصر غير موجود."); return
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    if acc.get("balance",0) < item["price"]:
+        bot.reply_to(m, "❌ رصيدك غير كافٍ."); return
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -item["price"]}, "$push": {"assets": item}})
+    record_transaction(m.chat.id, "buy", m.from_user.id, None, item["price"], note=item["item_id"])
+    bot.reply_to(m, f"✅ اشتريت {item['name']} بسعر {format_money(item['price'])}")
+
+@bot.message_handler(func=lambda m: m.text == "ممتلكاتي")
+def my_assets(m):
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    assets = acc.get("assets", [])
+    if not assets:
+        bot.reply_to(m, "🔍 ليس لديك ممتلكات حالياً."); return
+    msg = "🏷 ممتلكاتك:\n"
+    for it in assets:
+        msg += f"- {it.get('name')} — {format_money(it.get('price',0))}\n"
+    bot.reply_to(m, msg)
+
+# === تبرع ===
+@bot.message_handler(func=lambda m: m.text == "تبرع")
+def donate_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "📬 رد على رسالة الشخص واكتب: /donate <amount>")
+
+@bot.message_handler(commands=['donate'])
+def donate_cmd(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    if not m.reply_to_message:
+        bot.reply_to(m, "❗ رد على رسالة المستلم."); return
+    try:
+        amount = int(m.text.split()[1])
+    except:
+        bot.reply_to(m, "❗ الصيغة غير صحيحة."); return
+    donor = ensure_user_account(m.chat.id, m.from_user)
+    receiver = ensure_user_account(m.chat.id, m.reply_to_message.from_user)
+    if donor.get("balance",0) < amount:
+        bot.reply_to(m, "❌ معندكش رصيد كافٍ."); return
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -amount}})
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.reply_to_message.from_user.id}, {"$inc": {"balance": amount}})
+    record_transaction(m.chat.id, "donate", m.from_user.id, m.reply_to_message.from_user.id, amount)
+    bot.reply_to(m, f"✅ تم التبرع بـ {format_money(amount)} إلى {m.reply_to_message.from_user.first_name}")
+
+# === انشاء نادي وشراء لاعب (مبسط) ===
+@bot.message_handler(func=lambda m: m.text == "انشاء نادي")
+def create_club_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "✳️ اكتب اسم النادي الآن:")
+    bot.register_next_step_handler(m, create_club_do)
+
+def create_club_do(m):
+    name = m.text.strip()
+    if not name:
+        bot.reply_to(m, "❗ الاسم فارغ."); return
+    club = {"chat_id": m.chat.id, "owner": m.from_user.id, "name": name, "players": [], "cash": 0}
+    clubs_col.insert_one(club)
+    bot.reply_to(m, f"⚽ تم إنشاء النادي: {name}")
+
+@bot.message_handler(func=lambda m: m.text == "شراء لاعب")
+def buy_player_prompt(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    bot.reply_to(m, "✳️ اكتب: /buyplayer <owner_id>")
+
+@bot.message_handler(commands=['buyplayer'])
+def buy_player_cmd(m):
+    try:
+        owner_id = int(m.text.split()[1])
+    except:
+        bot.reply_to(m, "❗ الصيغة: /buyplayer <owner_id>"); return
+    club = clubs_col.find_one({"chat_id": m.chat.id, "owner": owner_id})
+    if not club:
+        bot.reply_to(m, "❗ النادي غير موجود."); return
+    price = random.randint(50,300)
+    acc = ensure_user_account(m.chat.id, m.from_user)
+    if acc.get("balance",0) < price:
+        bot.reply_to(m, "❌ معندكش رصيد كافٍ."); return
+    player = {"name": f"لاعب{random.randint(1,9999)}", "skill": random.randint(1,100), "price": price}
+    clubs_col.update_one({"_id": club["_id"]}, {"$push": {"players": player}})
+    users_col.update_one({"chat_id": m.chat.id, "user_id": m.from_user.id}, {"$inc": {"balance": -price}})
+    record_transaction(m.chat.id, "buyplayer", m.from_user.id, None, price)
+    bot.reply_to(m, f"✅ اشتريت لاعبًا بـ {format_money(price)} لنادي {club['name']}")
+
+# === ألعاب إضافية وأسئلة ومشاهير ===
+@bot.message_handler(func=lambda m: m.text == "🕹 العاب جديدة")
+def new_games_menu(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🧠 اسألني سؤال", "🌟 مشاهير", "🔁 لعبة العكس")
+    markup.add("⬅️ رجوع")
+    bot.send_message(m.chat.id, "اختار اللعبة:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "🧠 اسألني سؤال")
+def ask_question(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    # read random question from questions collection (fallback to sample)
+    qdoc = questions_col.aggregate([{"$sample": {"size": 1}}])
+    q = None
+    for item in qdoc:
+        q = item.get("text")
+    if not q:
+        # fallback
+        q = random.choice([
+            "ما هو أكبر كوكب في المجموعة الشمسية؟",
+            "من مؤسس شركة مايكروسوفت؟",
+            "في أي قارة تقع مصر؟"
+        ])
+    bot.reply_to(m, f"❓ سؤالك: {q}")
+
+@bot.message_handler(func=lambda m: m.text == "🌟 مشاهير")
+def show_celebrity(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    celebs = ["محمد صلاح ⚽️","كريستيانو رونالدو ⚽️","ليوناردو دي كابريو 🎬","إيلون ماسك 🚀","بيونسيه 🎤"]
+    bot.reply_to(m, f"👤 المشهور: {random.choice(celebs)}\nاحزر شخصيته أو اكتب رأيك!")
+
+@bot.message_handler(func=lambda m: m.text == "🔁 لعبة العكس")
+def opposite_game(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    pairs = [("ليل","نهار"),("سعيد","حزين"),("كبير","صغير"),("حار","بارد")]
+    w,o = random.choice(pairs)
+    bot.reply_to(m, f"اكتب عكس الكلمة: {w}")
+
+# === تسلية ===
+@bot.message_handler(func=lambda m: m.text == "😂 تسلية")
+def fun_menu(m):
+    if not require_subscription(m.from_user.id):
+        send_subscription_prompt(m.chat.id); return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🤣 نكتة", "💭 حكمة", "🎯 معلومة عشوائية")
+    markup.add("⬅️ رجوع")
+    bot.send_message(m.chat.id, "اختار:", reply_markup=markup)
+
+@bot.message_handler(func=lambda m: m.text == "🤣 نكتة")
+def send_joke(m):
+    jdoc = fun_col.aggregate([{"$sample": {"size": 1}}])
+    joke = None
+    for it in jdoc:
+        joke = random.choice(it.get("jokes", []))
+    if not joke:
+        joke = "مافيش نكت الآن."
+    bot.reply_to(m, joke)
+
+@bot.message_handler(func=lambda m: m.text == "💭 حكمة")
+def send_wisdom(m):
+    wdoc = fun_col.find_one() or {}
+    wisdoms = wdoc.get("wisdoms", ["لا توجد حكم الآن."])
+    bot.reply_to(m, random.choice(wisdoms))
+
+@bot.message_handler(func=lambda m: m.text == "🎯 معلومة عشوائية")
+def send_fact(m):
+    fdoc = fun_col.find_one() or {}
+    facts = fdoc.get("facts", ["لا توجد معلومات الآن."])
+    bot.reply_to(m, random.choice(facts))
+
+# === اوامر المطور: اذاعة و احصائيات و إدارة محتوى ===
+@bot.message_handler(func=lambda m: m.text == "🔧 اوامر المطور")
+def dev_menu(m):
+    if m.from_user.id != DEV_ID:
+        bot.reply_to(m, "❌ الأمر خاص بالمطور فقط."); return
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("📢 اذاعة", "📢 اذاعة مجموعة", "✏️ إضافة سؤال", "➖ حذف سؤال")
+    markup.add("➕ إضافة نكتة", "➖ حذف نكتة", "🧾 احصائيات", "🔙 رجوع")
+    bot.reply_to(m, "أدوات المطور:", reply_markup=markup)
+
+# اذاعة عامة
+@bot.message_handler(func=lambda m: m.text == "📢 اذاعة")
+def start_broadcast(m):
+    if m.from_user.id != DEV_ID:
+        return
+    bot.reply_to(m, "📢 اكتب الرسالة التي تريد اذاعتها الآن:")
+    bot.register_next_step_handler(m, do_broadcast)
+
+def do_broadcast(m):
+    if m.from_user.id != DEV_ID:
+        return
+    text = m.text
+    sent = 0; failed = 0
+    # نرسل لكل المستخدمين الذين لديهم حساب (عبر جميع الجروبات)
+    for u in users_col.find({"has_account": True}):
+        try:
+            bot.send_message(int(u["user_id"]), f"📢 رسالة من المطور:\n\n{text}")
+            sent += 1
+        except:
+            failed += 1
+    bot.reply_to(m, f"✅ تم الإرسال إلى {sent} مستخدم. فشل عند {failed}.")
+
+# احصائيات
+@bot.message_handler(func=lambda m: m.text == "🧾 احصائيات")
+def dev_stats(m):
+    if m.from_user.id != DEV_ID: return
+    total_users = users_col.count_documents({"has_account": True})
+    total_balance = 0
+    for u in users_col.find({"has_account": True}):
+        total_balance += u.get("balance",0)
+    bot.reply_to(m, f"📊 إحصائيات:\nالمستخدمين: {total_users}\nإجمالي الأرصدة: {format_money(total_balance)}")
+
+# إدارة الأسئلة (اضافة / حذف)
+@bot.message_handler(func=lambda m: m.text == "✏️ إضافة سؤال")
+def add_question_prompt(m):
+    if m.from_user.id != DEV_ID: return
+    bot.reply_to(m, "✏️ اكتب السؤال الجديد الآن:")
+    bot.register_next_step_handler(m, add_question)
+
+def add_question(m):
+    if m.from_user.id != DEV_ID: return
+    q = m.text.strip()
+    if q:
+        questions_col.insert_one({"text": q})
+        bot.reply_to(m, "✅ تم إضافة السؤال.")
+    else:
+        bot.reply_to(m, "❗ السؤال فارغ.")
+
+@bot.message_handler(func=lambda m: m.text == "➖ حذف سؤال")
+def del_question_prompt(m):
+    if m.from_user.id != DEV_ID: return
+    bot.reply_to(m, "✂️ اكتب نص السؤال بالضبط لحذفه:")
+    bot.register_next_step_handler(m, del_question)
+
+def del_question(m):
+    if m.from_user.id != DEV_ID: return
+    q = m.text.strip()
+    res = questions_col.delete_one({"text": q})
+    if res.deleted_count:
+        bot.reply_to(m, "✅ تم حذف السؤال.")
+    else:
+        bot.reply_to(m, "❗ لم أجد هذا السؤال.")
+
+@bot.message_handler(func=lambda m: m.text == "➕ إضافة نكتة")
+def add_joke_prompt(m):
+    if m.from_user.id != DEV_ID: return
+    bot.reply_to(m, "✏️ اكتب النكتة الآن:")
+    bot.register_next_step_handler(m, add_joke)
+
+def add_joke(m):
+    if m.from_user.id != DEV_ID: return
+    j = m.text.strip()
+    if not j:
+        bot.reply_to(m, "❗ النص فارغ."); return
+    fun_col.update_one({}, {"$push": {"jokes": j}}, upsert=True)
+    bot.reply_to(m, "✅ تم إضافة النكتة.")
+
+@bot.message_handler(func=lambda m: m.text == "➖ حذف نكتة")
+def del_joke_prompt(m):
+    if m.from_user.id != DEV_ID: return
+    bot.reply_to(m, "✂️ اكتب نص النكتة بالضبط لحذفها:")
+    bot.register_next_step_handler(m, del_joke)
+
+def del_joke(m):
+    if m.from_user.id != DEV_ID: return
+    j = m.text.strip()
+    fun = fun_col.find_one() or {}
+    if j in fun.get("jokes", []):
+        fun_col.update_one({}, {"$pull": {"jokes": j}})
+        bot.reply_to(m, "✅ تم حذف النكتة.")
+    else:
+        bot.reply_to(m, "❗ لم أجد النكتة.")
+
+# === تجاهل الرسائل غير النصية ===
+@bot.message_handler(func=lambda m: not m.text)
+def ignore_non_text(m):
+    pass
+
+# === تشغيل البوت ===
+if __name__ == "__main__":
+    print("Bot started...")
+    # استخدم infinity_polling أو polling وفق حاجتك
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
