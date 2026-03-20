@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # === إعدادات - ضع هذه المتغيرات في Render Environment أو في ملف .env محليًا ===
-TOKEN = os.getenv("TOKEN") or "8455107490:AAEbIFpHcKw3nWtiJkvtMMc6petNo5wZzm0"
+TOKEN = os.getenv("TOKEN") or "8578349479:AAG9uVMLbtheE7Jgd4zXpmbEZGpN9q_tbz4"
 CHANNEL = os.getenv("CHANNEL") or "@Youssef_Osama2005"   # مثال: @Youssef_Osama2005
 DEV_ID = int(os.getenv("7938146499") or 0)                 # رقم الآي دي للمطور (مثلاً: 7938146499)
 MONGO_URI = os.getenv("MONGO_URI")                    # URI من MongoDB Atlas
